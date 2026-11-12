@@ -10,6 +10,7 @@ syncing, delete-and-repost syncing, and full channel resets.
 import asyncio
 import hashlib
 import logging
+import os
 import re
 import shutil
 import urllib.parse
@@ -44,6 +45,14 @@ TargetChannel = Union[discord.TextChannel, discord.Thread]
 
 class PostsAsCodeError(Exception):
     """Base user-facing error for PostsAsCode."""
+
+
+class PartialSyncError(PostsAsCodeError):
+    """Raised when a sync fails mid-way after already modifying Discord state."""
+
+    def __init__(self, message: str, partial_slots: list[dict]) -> None:
+        super().__init__(message)
+        self.partial_slots = partial_slots
 
 
 @dataclass
@@ -119,9 +128,6 @@ def split_markdown(text: str, limit: int = MAX_MESSAGE_LENGTH) -> list[str]:
 
     while remaining:
         prefix = f"{active_fence}\n" if active_fence else ""
-        closing_marker = active_fence[:3] if active_fence else ""
-        # Reserve space for closing a fence if we end up splitting inside one.
-        reserve_close = len(f"\n{closing_marker}") if closing_marker else 0
 
         if len(prefix) + len(remaining) <= limit:
             chunks.append(prefix + remaining)
@@ -134,10 +140,10 @@ def split_markdown(text: str, limit: int = MAX_MESSAGE_LENGTH) -> list[str]:
         window = remaining[:max_body]
         split_at = _find_split_index(window)
 
-        part = remaining[:split_at].rstrip()
+        part = remaining[:split_at].rstrip(" \t\r")
         trimmed = False
         if not part:
-            # Handle leading whitespace edge case by advancing at least 1 char.
+            # Handle leading whitespace/blank-line edge case by advancing cleanly.
             split_at = max(1, min(max_body, len(remaining)))
             part = remaining[:split_at]
 
@@ -300,6 +306,14 @@ def scan_folder(
                 continue
             if size > filesize_limit:
                 oversized_images.append((file_path.name, size))
+                slots.append(
+                    DesiredSlot(
+                        kind="image",
+                        source=file_path.name,
+                        content_hash="oversized",
+                        file_path=file_path,
+                    )
+                )
                 continue
 
             raw_bytes = file_path.read_bytes()
@@ -437,8 +451,6 @@ class PostsAsCode(commands.Cog):
         env = {"GIT_TERMINAL_PROMPT": "0"}
 
         # Preserve minimal OS environment variables needed by git/SSL/HOME.
-        import os
-
         for key in (
             "PATH",
             "HOME",
@@ -677,7 +689,6 @@ class PostsAsCode(commands.Cog):
         mode: str,
     ) -> tuple[SyncStats, list[dict]]:
         target = await self._resolve_target(guild, target_id)
-        await self._ensure_thread_open(target)
 
         has_images = any(s.kind == "image" for s in scan.slots)
         existing_slots: list[dict] = list(mapping.get("slots", []))
@@ -688,6 +699,7 @@ class PostsAsCode(commands.Cog):
             needs_manage_messages=(mode == "reset"),
             needs_history=(mode in ("edit", "reset")),
         )
+        await self._ensure_thread_open(target)
 
         stats = SyncStats(
             target_id=target_id,
@@ -697,31 +709,38 @@ class PostsAsCode(commands.Cog):
         new_slots: list[dict] = []
 
         if mode == "reset":
-            stats.purged = await self._purge_all_messages(target)
-            for slot in scan.slots:
-                sent = await self._send_slot(target, slot)
-                new_slots.append(self._slot_record(sent.id, slot))
-                stats.created += 1
-                await asyncio.sleep(API_DELAY_SECONDS)
+            try:
+                stats.purged = await self._purge_all_messages(target)
+                for slot in scan.slots:
+                    sent = await self._send_slot(target, slot)
+                    new_slots.append(self._slot_record(sent.id, slot))
+                    stats.created += 1
+                    await asyncio.sleep(API_DELAY_SECONDS)
+            except discord.HTTPException as exc:
+                raise PartialSyncError(str(exc), new_slots) from exc
 
         elif mode == "repost":
-            for prev in existing_slots:
-                msg_id = prev.get("message_id")
-                if not msg_id:
-                    continue
-                try:
-                    msg = target.get_partial_message(msg_id)
-                    await msg.delete()
-                    stats.deleted += 1
-                    await asyncio.sleep(API_DELAY_SECONDS)
-                except discord.NotFound:
-                    pass
+            remaining_old = list(existing_slots)
+            try:
+                for idx, prev in enumerate(existing_slots):
+                    msg_id = prev.get("message_id")
+                    if msg_id:
+                        try:
+                            msg = target.get_partial_message(msg_id)
+                            await msg.delete()
+                            stats.deleted += 1
+                            await asyncio.sleep(API_DELAY_SECONDS)
+                        except discord.NotFound:
+                            pass
+                    remaining_old = existing_slots[idx + 1 :]
 
-            for slot in scan.slots:
-                sent = await self._send_slot(target, slot)
-                new_slots.append(self._slot_record(sent.id, slot))
-                stats.created += 1
-                await asyncio.sleep(API_DELAY_SECONDS)
+                for slot in scan.slots:
+                    sent = await self._send_slot(target, slot)
+                    new_slots.append(self._slot_record(sent.id, slot))
+                    stats.created += 1
+                    await asyncio.sleep(API_DELAY_SECONDS)
+            except discord.HTTPException as exc:
+                raise PartialSyncError(str(exc), new_slots + remaining_old) from exc
 
         else:  # mode == "edit"
             surviving: list[tuple[dict, discord.Message]] = []
@@ -735,34 +754,41 @@ class PostsAsCode(commands.Cog):
                 except discord.NotFound:
                     continue
 
-            for idx, desired in enumerate(scan.slots):
-                if idx < len(surviving):
-                    prev_meta, msg = surviving[idx]
-                    if (
-                        prev_meta.get("kind") == desired.kind
-                        and prev_meta.get("hash") == desired.content_hash
-                    ):
-                        new_slots.append(self._slot_record(msg.id, desired))
-                        stats.unchanged += 1
-                        continue
+            processed_surviving = 0
+            try:
+                for idx, desired in enumerate(scan.slots):
+                    if idx < len(surviving):
+                        prev_meta, msg = surviving[idx]
+                        processed_surviving = idx + 1
+                        if (
+                            prev_meta.get("kind") == desired.kind
+                            and prev_meta.get("hash") == desired.content_hash
+                        ):
+                            new_slots.append(self._slot_record(msg.id, desired))
+                            stats.unchanged += 1
+                            continue
 
-                    edited_msg = await self._edit_slot(msg, desired)
-                    new_slots.append(self._slot_record(edited_msg.id, desired))
-                    stats.edited += 1
-                    await asyncio.sleep(API_DELAY_SECONDS)
-                else:
-                    sent = await self._send_slot(target, desired)
-                    new_slots.append(self._slot_record(sent.id, desired))
-                    stats.created += 1
-                    await asyncio.sleep(API_DELAY_SECONDS)
+                        edited_msg = await self._edit_slot(msg, desired)
+                        new_slots.append(self._slot_record(edited_msg.id, desired))
+                        stats.edited += 1
+                        await asyncio.sleep(API_DELAY_SECONDS)
+                    else:
+                        sent = await self._send_slot(target, desired)
+                        new_slots.append(self._slot_record(sent.id, desired))
+                        stats.created += 1
+                        await asyncio.sleep(API_DELAY_SECONDS)
 
-            for _, extra_msg in surviving[len(scan.slots) :]:
-                try:
-                    await extra_msg.delete()
-                    stats.deleted += 1
-                    await asyncio.sleep(API_DELAY_SECONDS)
-                except discord.NotFound:
-                    pass
+                for extra_meta, extra_msg in surviving[len(scan.slots) :]:
+                    try:
+                        await extra_msg.delete()
+                        stats.deleted += 1
+                        await asyncio.sleep(API_DELAY_SECONDS)
+                    except discord.NotFound:
+                        pass
+                    processed_surviving += 1
+            except discord.HTTPException as exc:
+                unvisited = [meta for meta, _ in surviving[processed_surviving:]]
+                raise PartialSyncError(str(exc), new_slots + unvisited) from exc
 
         return stats, new_slots
 
@@ -799,7 +825,12 @@ class PostsAsCode(commands.Cog):
                 "Please provide a valid `https://`, `http://`, `ssh://`, or `git@` repository URL."
             )
             return
-        if not cleaned_branch or cleaned_branch.startswith("-"):
+        if (
+            not cleaned_branch
+            or cleaned_branch.startswith("-")
+            or ".." in cleaned_branch
+            or not re.match(r"^[A-Za-z0-9._/-]+$", cleaned_branch)
+        ):
             await ctx.send("Please provide a valid branch name.")
             return
 
@@ -834,6 +865,19 @@ class PostsAsCode(commands.Cog):
         else:
             await ctx.send("Repository access token cleared.")
 
+    @staticmethod
+    def _sanitize_mapping_path(repo_path: str) -> Optional[str]:
+        cleaned = repo_path.strip().replace("\\", "/").strip("/") or "."
+        parts = Path(cleaned).parts
+        if (
+            "\x00" in cleaned
+            or cleaned.startswith("-")
+            or ".." in parts
+            or ".git" in parts
+        ):
+            return None
+        return cleaned
+
     @postsascode.command(name="map")
     async def pac_map(
         self,
@@ -842,8 +886,8 @@ class PostsAsCode(commands.Cog):
         repo_path: str,
     ) -> None:
         """Associate a text channel or plain thread with a folder in the repository."""
-        cleaned = repo_path.strip().replace("\\", "/").strip("/") or "."
-        if cleaned.startswith("-") or ".." in Path(cleaned).parts:
+        cleaned = self._sanitize_mapping_path(repo_path)
+        if cleaned is None:
             await ctx.send("Invalid repository path.")
             return
 
@@ -872,8 +916,8 @@ class PostsAsCode(commands.Cog):
         thread_name: str,
     ) -> None:
         """Create a new plain public thread in a channel and map it to a repo folder."""
-        cleaned = repo_path.strip().replace("\\", "/").strip("/") or "."
-        if cleaned.startswith("-") or ".." in Path(cleaned).parts:
+        cleaned = self._sanitize_mapping_path(repo_path)
+        if cleaned is None:
             await ctx.send("Invalid repository path.")
             return
 
@@ -1180,6 +1224,14 @@ class PostsAsCode(commands.Cog):
                         stats, new_slots = await self._apply_sync_to_target(
                             ctx.guild, int(tid), info, scan, mode
                         )
+                    except PartialSyncError as exc:
+                        async with self.config.guild(ctx.guild).mappings() as mutable:
+                            if tid in mutable:
+                                mutable[tid]["slots"] = exc.partial_slots
+                        results.append(
+                            f"• {label} (`{info['path']}`): ❌ Partial sync error (progress saved): {exc}"
+                        )
+                        continue
                     except (PostsAsCodeError, discord.HTTPException) as exc:
                         results.append(f"• {label} (`{info['path']}`): ❌ {exc}")
                         continue

@@ -217,6 +217,8 @@ def test_scan_folder_flags_oversized_image(tmp_path: Path):
 
     scan = scan_folder(tmp_path, "imgs", filesize_limit=1024)
     assert scan.oversized_images == [("01-huge.jpg", 2048)]
+    assert len(scan.slots) == 1
+    assert scan.slots[0].content_hash == "oversized"
 
 
 def test_compute_slot_diff():
@@ -556,5 +558,61 @@ def test_git_clone_and_pull_roundtrip(tmp_path: Path):
         sha2 = await cog._sync_git_repo(guild)
         assert sha2 != sha1
         assert cloned_file.read_text(encoding="utf-8") == "v2"
+
+    asyncio.run(run())
+
+
+def test_sanitize_mapping_path():
+    assert PostsAsCode._sanitize_mapping_path("discord/rules") == "discord/rules"
+    assert PostsAsCode._sanitize_mapping_path("/") == "."
+    assert PostsAsCode._sanitize_mapping_path("../secret") is None
+    assert PostsAsCode._sanitize_mapping_path(".git/hooks") is None
+    assert PostsAsCode._sanitize_mapping_path("-flag") is None
+
+
+def test_partial_sync_saves_progress_on_http_error(tmp_path: Path):
+    async def run():
+        guild = MagicMock()
+        guild.id = 42
+        guild.filesize_limit = 8 * 1024 * 1024
+        guild.me = MagicMock()
+
+        chan = FakeChannel(111, guild)
+        orig_send = chan.send
+        send_count = 0
+
+        async def flaky_send(content="", file=None, delete_after=None):
+            nonlocal send_count
+            send_count += 1
+            if send_count == 2:
+                raise discord.HTTPException("Simulated transient 503")
+            return await orig_send(content=content, file=file, delete_after=delete_after)
+
+        chan.send = flaky_send
+        guild.get_channel_or_thread = lambda cid: chan if cid == 111 else None
+
+        repo_dir = tmp_path / "repos" / "42" / "docs"
+        repo_dir.mkdir(parents=True)
+        (repo_dir / "01.md").write_text("First", encoding="utf-8")
+        (repo_dir / "02.md").write_text("Second", encoding="utf-8")
+
+        guild_data = {
+            "mappings": {"111": {"path": "docs", "slots": [], "last_synced": None}},
+        }
+        cog = _make_cog(tmp_path, guild_data)
+        cog._sync_git_repo = AsyncMock(return_value="abc1234")
+
+        ctx = MagicMock()
+        ctx.guild = guild
+        ctx.channel = chan
+        ctx.clean_prefix = "!"
+        ctx.send = AsyncMock()
+        ctx.typing = MagicMock(return_value=AsyncMock(__aenter__=AsyncMock(), __aexit__=AsyncMock()))
+
+        await cog._execute_sync(ctx, target=chan, mode="repost")
+        saved_slots = guild_data["mappings"]["111"]["slots"]
+        assert len(saved_slots) == 1
+        assert saved_slots[0]["source"] == "01.md"
+        assert "Partial sync error (progress saved)" in ctx.send.call_args[0][0]
 
     asyncio.run(run())
