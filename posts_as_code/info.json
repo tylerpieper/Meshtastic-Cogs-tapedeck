@@ -1,0 +1,12 @@
+{
+    "author": ["tylerpieper"],
+    "name": "PostsAsCode",
+    "short": "Sync Discord channels and threads from Markdown and image files in a Git repository.",
+    "description": "Manage static Discord documentation channels and threads (rules, getting-started guides, FAQs) as code in a Git repository. Maps channels or threads to repository folders containing ordered Markdown (.md) and image files, and syncs via edit-in-place, delete-and-repost, or full channel reset.",
+    "end_user_data_statement": "This cog does not persistently store data or metadata about users. It stores per-guild Git repository settings, channel/thread mappings, and IDs and content hashes of messages posted by the bot.",
+    "hidden": false,
+    "disabled": false,
+    "min_bot_version": "3.5.0",
+    "min_python_version": [3, 11, 0],
+    "tags": ["utility", "documentation", "admin", "git"]
+}

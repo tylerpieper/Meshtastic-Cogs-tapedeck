@@ -31,7 +31,7 @@ jobs:
         run: pip install paho-mqtt>=2.0 meshtastic cryptography aiohttp
 
       - name: Syntax check (compile all cogs)
-        run: python -m compileall -q mqttbridge strikes
+        run: python -m compileall -q mqttbridge strikes posts_as_code
 
       - name: Lint with flake8
         run: |
@@ -39,9 +39,10 @@ jobs:
           # E9   — syntax / indentation errors (always fatal)
           # F821 — undefined name (would crash at runtime)
           # F811 — redefinition of an unused import / name
-          flake8 mqttbridge strikes --count --select=E9,F821,F811 --show-source --statistics
+          flake8 mqttbridge strikes posts_as_code --count --select=E9,F821,F811 --show-source --statistics
 
       - name: Verify cog imports
         run: |
-          python -c "import mqttbridge; print('mqttbridge: OK')"
-          python -c "import strikes;    print('strikes:    OK')"
+          python -c "import mqttbridge;    print('mqttbridge:    OK')"
+          python -c "import strikes;       print('strikes:       OK')"
+          python -c "import posts_as_code; print('posts_as_code: OK')"
