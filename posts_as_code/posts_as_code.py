@@ -630,13 +630,13 @@ class PostsAsCode(commands.Cog):
                     f"Failed to unarchive thread {target.mention}: {exc}"
                 ) from exc
 
-    def _check_permissions(
-        self,
+    @staticmethod
+    def _missing_permissions(
         target: TargetChannel,
         needs_attachments: bool,
         needs_manage_messages: bool,
         needs_history: bool,
-    ) -> None:
+    ) -> list[str]:
         perms = target.permissions_for(target.guild.me)
         missing: list[str] = []
 
@@ -658,6 +658,21 @@ class PostsAsCode(commands.Cog):
         if needs_manage_messages and not perms.manage_messages:
             missing.append("Manage Messages")
 
+        return missing
+
+    def _check_permissions(
+        self,
+        target: TargetChannel,
+        needs_attachments: bool,
+        needs_manage_messages: bool,
+        needs_history: bool,
+    ) -> None:
+        missing = self._missing_permissions(
+            target=target,
+            needs_attachments=needs_attachments,
+            needs_manage_messages=needs_manage_messages,
+            needs_history=needs_history,
+        )
         if missing:
             raise PostsAsCodeError(
                 f"Missing permissions in {target.mention}: {', '.join(missing)}."
@@ -953,10 +968,23 @@ class PostsAsCode(commands.Cog):
                     "last_synced": existing.get("last_synced"),
                 }
 
-        await ctx.send(
-            f"Mapped {target.mention} (`{target.id}`) to `{cleaned}`.\n"
-            f"Run `{ctx.clean_prefix}pac sync {target.mention}` to publish."
+        missing_perms = self._missing_permissions(
+            target=target,
+            needs_attachments=False,
+            needs_manage_messages=False,
+            needs_history=True,
         )
+        msg = (
+            f"Mapped {target.mention} (`{target.id}`) to `{cleaned}`.\n"
+            f"Run `{ctx.clean_prefix}pac test {target.mention}` to verify access, "
+            f"or `{ctx.clean_prefix}pac sync {target.mention}` to publish."
+        )
+        if missing_perms:
+            msg += (
+                f"\n⚠️ Missing permissions in {target.mention}: "
+                f"{', '.join(missing_perms)}."
+            )
+        await ctx.send(msg)
 
     @postsascode.command(name="mkthread")
     async def pac_mkthread(
@@ -1105,6 +1133,132 @@ class PostsAsCode(commands.Cog):
                     f"• {mention} → `{info.get('path')}` "
                     f"({slot_count} tracked post(s), last synced: {last_synced})"
                 )
+
+        await self._send_chunked(ctx, "\n".join(lines))
+
+    @postsascode.command(name="test", aliases=["check", "doctor"])
+    async def pac_test(
+        self, ctx: commands.Context, target: Optional[TargetChannel] = None
+    ) -> None:
+        """
+        Run a read-only preflight check on repo access, channel permissions, and files.
+
+        Does not post, edit, or delete any Discord messages.
+        """
+        async with self._get_lock(ctx.guild.id):
+            mappings = await self.config.guild(ctx.guild).mappings()
+            selected = self._select_mappings(mappings, target) if mappings else {}
+            if target is not None and not selected:
+                await ctx.send(f"{target.mention} is not mapped.")
+                return
+
+            lines: list[str] = ["**PostsAsCode Preflight Test**"]
+            repo_ok = False
+            commit_sha = None
+
+            async with ctx.typing():
+                if not shutil.which("git"):
+                    lines.append("• **Git CLI:** ❌ `git` not found on PATH")
+                else:
+                    lines.append("• **Git CLI:** ✅ Available")
+                    try:
+                        commit_sha = await self._sync_git_repo(ctx.guild)
+                        repo_ok = True
+                        lines.append(f"• **Repository:** ✅ Synced @ `{commit_sha}`")
+                    except PostsAsCodeError as exc:
+                        lines.append(f"• **Repository:** ❌ {exc}")
+
+                if not mappings:
+                    lines.append("• **Mappings:** ⚠️ No channels or threads mapped yet.")
+                else:
+                    lines.append("")
+                    lines.append("**Channel / Thread Checks:**")
+                    repo_dir = self._repo_dir(ctx.guild.id)
+                    variables: dict[str, str] = (
+                        await self.config.guild(ctx.guild).variables() or {}
+                    )
+
+                    for tid, info in selected.items():
+                        repo_path = info["path"]
+                        label = self._target_label(ctx.guild, tid)
+                        issues: list[str] = []
+                        notes: list[str] = []
+
+                        resolved: Optional[TargetChannel] = None
+                        try:
+                            resolved = await self._resolve_target(ctx.guild, int(tid))
+                            label = resolved.mention
+                        except PostsAsCodeError as exc:
+                            issues.append(f"❌ {exc}")
+
+                        scan: Optional[FolderScanResult] = None
+                        if repo_ok:
+                            try:
+                                scan = scan_folder(
+                                    repo_dir,
+                                    repo_path,
+                                    ctx.guild.filesize_limit,
+                                    variables=variables,
+                                )
+                            except PostsAsCodeError as exc:
+                                issues.append(f"❌ {exc}")
+
+                        if resolved is not None:
+                            has_images = (
+                                any(s.kind == "image" for s in scan.slots)
+                                if scan is not None
+                                else False
+                            )
+                            missing_core = self._missing_permissions(
+                                target=resolved,
+                                needs_attachments=has_images,
+                                needs_manage_messages=False,
+                                needs_history=True,
+                            )
+                            if missing_core:
+                                issues.append(
+                                    f"❌ Missing permissions: {', '.join(missing_core)}"
+                                )
+                            perms = resolved.permissions_for(ctx.guild.me)
+                            if not perms.manage_messages:
+                                notes.append(
+                                    "ℹ️ Missing `Manage Messages` (only needed for `reset`)"
+                                )
+
+                        if scan is not None:
+                            if scan.oversized_images:
+                                imgs = ", ".join(
+                                    f"`{n}` ({sz // 1024} KB)"
+                                    for n, sz in scan.oversized_images
+                                )
+                                issues.append(f"❌ Oversized image(s): {imgs}")
+                            if scan.oversized_markdown:
+                                mds = ", ".join(
+                                    f"`{n}` ({c} chars → {p} posts)"
+                                    for n, c, p in scan.oversized_markdown
+                                )
+                                notes.append(f"⚠️ Over 2,000 chars: {mds}")
+                            if scan.missing_variables:
+                                missing_v = ", ".join(
+                                    f"`{fn}` ({', '.join(f'`{v}`' for v in vl)})"
+                                    for fn, vl in scan.missing_variables
+                                )
+                                notes.append(f"⚠️ Unset variable(s): {missing_v}")
+
+                        if not issues:
+                            post_info = (
+                                f"{len(scan.slots)} post(s) ready"
+                                if scan is not None
+                                else "permissions OK"
+                            )
+                            lines.append(f"• {label} (`{repo_path}`): ✅ {post_info}")
+                        else:
+                            lines.append(f"• {label} (`{repo_path}`):")
+                            for iss in issues:
+                                lines.append(f"  {iss}")
+
+                        for note in notes:
+                            lines.append(f"  {note}")
 
         await self._send_chunked(ctx, "\n".join(lines))
 

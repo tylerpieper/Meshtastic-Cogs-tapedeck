@@ -69,6 +69,7 @@ All commands require **Admin** role or **Manage Guild** permission (`[p]postsasc
 | `[p]pac var set <name> <value>` | Set a template variable for `{{NAME}}` placeholders |
 | `[p]pac var unset <name>` | Remove a configured template variable |
 | `[p]pac var list` | List all configured template variables and their values |
+| `[p]pac test [channel_or_thread]` | Read-only preflight check (git/repo access, channel permissions, files, variables) |
 | `[p]pac diff [channel_or_thread]` | Pull the repo and preview changes without modifying Discord |
 | `[p]pac sync [channel_or_thread] [mode=edit]` | Pull the repo and sync mapped target(s) (`edit`, `repost`, or `reset`) |
 | `[p]pac reset <channel_or_thread>` | Confirm, purge all messages in a mapped target, and re-post |

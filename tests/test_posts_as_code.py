@@ -699,3 +699,59 @@ def test_sync_lists_variables_and_warns_on_unset(tmp_path: Path):
         assert "`MQTT_PASS` = `mesh123`" in summary
 
     asyncio.run(run())
+
+
+def test_pac_test_reports_permissions_and_readiness(tmp_path: Path):
+    async def run():
+        guild = MagicMock()
+        guild.id = 42
+        guild.filesize_limit = 8 * 1024 * 1024
+        guild.me = MagicMock()
+
+        chan_ok = FakeChannel(111, guild)
+        chan_no_send = FakeChannel(222, guild)
+
+        def restricted_perms(member):
+            perms = FakeChannel.permissions_for(chan_no_send, member)
+            perms.send_messages = False
+            perms.manage_messages = False
+            return perms
+
+        chan_no_send.permissions_for = restricted_perms
+        guild.get_channel_or_thread = lambda cid: (
+            chan_ok if cid == 111 else chan_no_send if cid == 222 else None
+        )
+
+        (tmp_path / "repos" / "42" / "rules").mkdir(parents=True)
+        (tmp_path / "repos" / "42" / "rules" / "01.md").write_text("Rule 1", encoding="utf-8")
+        (tmp_path / "repos" / "42" / "faq").mkdir(parents=True)
+        (tmp_path / "repos" / "42" / "faq" / "01.md").write_text("FAQ {{UNSET_VAR}}", encoding="utf-8")
+
+        guild_data = {
+            "mappings": {
+                "111": {"path": "rules", "slots": [], "last_synced": None},
+                "222": {"path": "faq", "slots": [], "last_synced": None},
+            },
+            "variables": {},
+        }
+        cog = _make_cog(tmp_path, guild_data)
+        cog._sync_git_repo = AsyncMock(return_value="abc1234")
+
+        ctx = MagicMock()
+        ctx.guild = guild
+        ctx.channel = chan_ok
+        ctx.clean_prefix = "!"
+        ctx.send = AsyncMock()
+        ctx.typing = MagicMock(return_value=AsyncMock(__aenter__=AsyncMock(), __aexit__=AsyncMock()))
+
+        await cog.pac_test(ctx)
+        report = ctx.send.call_args[0][0]
+        assert "✅ 1 post(s) ready" in report
+        assert "Missing permissions: Send Messages" in report
+        assert "Missing `Manage Messages`" in report
+        assert "Unset variable(s):" in report and "UNSET_VAR" in report
+        # Read-only check must not post to either channel
+        assert len(chan_ok.messages) == 0
+        assert len(chan_no_send.messages) == 0
+
+    asyncio.run(run())
