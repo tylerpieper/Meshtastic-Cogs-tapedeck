@@ -21,6 +21,7 @@ discord/
 ```
 
 - **Markdown files (`.md`):** Each file becomes one Discord post. If any `.md` file exceeds Discord's 2,000-character limit, `[p]pac sync` warns you before changing anything and lets you confirm splitting or cancel to edit the source file.
+- **Template variables (`{{VAR_NAME}}`):** Keep Discord-only values (such as MQTT credentials or modem settings) out of a public repository by putting `{{VAR_NAME}}` placeholders in your `.md` files and configuring values with `[p]pac var set <NAME> <value>`. On sync/diff, the cog lists all called variables and their current values, and warns/prompts if any are unset.
 - **Image files (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`):** Posted as standalone image messages in sequence between surrounding `.md` posts. Checked against the server's upload size limit before syncing.
 
 ---
@@ -65,6 +66,9 @@ All commands require **Admin** role or **Manage Guild** permission (`[p]postsasc
 | `[p]pac mkthread <channel> <repo_path> <thread_name>` | Create a new plain public thread and map it |
 | `[p]pac unmap <channel_or_thread>` | Remove a mapping (keeps existing Discord messages) |
 | `[p]pac list` | Show repo settings, last synced commit, and mappings |
+| `[p]pac var set <name> <value>` | Set a template variable for `{{NAME}}` placeholders |
+| `[p]pac var unset <name>` | Remove a configured template variable |
+| `[p]pac var list` | List all configured template variables and their values |
 | `[p]pac diff [channel_or_thread]` | Pull the repo and preview changes without modifying Discord |
 | `[p]pac sync [channel_or_thread] [mode=edit]` | Pull the repo and sync mapped target(s) (`edit`, `repost`, or `reset`) |
 | `[p]pac reset <channel_or_thread>` | Confirm, purge all messages in a mapped target, and re-post |

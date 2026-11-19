@@ -14,7 +14,7 @@ import os
 import re
 import shutil
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Union
@@ -36,6 +36,8 @@ SUPPORTED_EXTENSIONS = TEXT_EXTENSIONS | IMAGE_EXTENSIONS
 VALID_SYNC_MODES = ("edit", "repost", "reset")
 API_DELAY_SECONDS = 0.25
 CONFIRM_TIMEOUT_SECONDS = 60
+VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+VAR_PLACEHOLDER_RE = re.compile(r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}")
 
 TargetChannel = Union[discord.TextChannel, discord.Thread]
 
@@ -76,6 +78,8 @@ class FolderScanResult:
     oversized_markdown: list[tuple[str, int, int]]  # (filename, char_len, chunk_count)
     oversized_images: list[tuple[str, int]]  # (filename, byte_size)
     empty_files: list[str]
+    used_variables: list[str] = field(default_factory=list)
+    missing_variables: list[tuple[str, list[str]]] = field(default_factory=list)
 
 
 @dataclass
@@ -98,6 +102,37 @@ class SyncStats:
 def normalize_markdown(raw_text: str) -> str:
     """Normalize line endings and strip leading/trailing whitespace."""
     return raw_text.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def substitute_variables(
+    text: str, variables: dict[str, str]
+) -> tuple[str, list[str], list[str]]:
+    """
+    Replace ``{{VAR_NAME}}`` placeholders using ``variables``.
+
+    Returns ``(rendered_text, used_vars, missing_vars)`` with unique variable
+    names preserved in order of first appearance. Missing placeholders are left
+    as-is in ``rendered_text``.
+    """
+    used: list[str] = []
+    missing: list[str] = []
+    seen_used: set[str] = set()
+    seen_missing: set[str] = set()
+
+    def _replace(match: re.Match) -> str:
+        name = match.group(1)
+        if name in variables:
+            if name not in seen_used:
+                seen_used.add(name)
+                used.append(name)
+            return variables[name]
+        if name not in seen_missing:
+            seen_missing.add(name)
+            missing.append(name)
+        return match.group(0)
+
+    rendered = VAR_PLACEHOLDER_RE.sub(_replace, text)
+    return rendered, used, missing
 
 
 def sha256_text(text: str) -> str:
@@ -234,12 +269,14 @@ def scan_folder(
     repo_dir: Path,
     rel_path: str,
     filesize_limit: int,
+    variables: Optional[dict[str, str]] = None,
 ) -> FolderScanResult:
     """
     Scan ``rel_path`` in ``repo_dir`` for ordered Markdown and image files.
 
-    Files are sorted lexicographically (case-insensitive). Returns desired
-    message slots alongside any oversized markdown/image diagnostics.
+    Files are sorted lexicographically (case-insensitive). Substitutes
+    ``{{VAR_NAME}}`` placeholders using ``variables`` before checking message
+    lengths and hashing. Returns desired message slots alongside diagnostics.
     """
     folder = validate_repo_path(repo_dir, rel_path)
     if not folder.exists() or not folder.is_dir():
@@ -261,10 +298,14 @@ def scan_folder(
             f"Mapped folder `{rel_path}` contains no supported `.md` or image files."
         )
 
+    var_map = variables or {}
     slots: list[DesiredSlot] = []
     oversized_markdown: list[tuple[str, int, int]] = []
     oversized_images: list[tuple[str, int]] = []
     empty_files: list[str] = []
+    used_variables: list[str] = []
+    seen_used_vars: set[str] = set()
+    missing_variables: list[tuple[str, list[str]]] = []
 
     for file_path in files:
         suffix = file_path.suffix.lower()
@@ -281,11 +322,19 @@ def scan_folder(
                 empty_files.append(file_path.name)
                 continue
 
-            if len(normalized) > MAX_MESSAGE_LENGTH:
-                chunks = split_markdown(normalized, MAX_MESSAGE_LENGTH)
-                oversized_markdown.append((file_path.name, len(normalized), len(chunks)))
+            rendered, file_used, file_missing = substitute_variables(normalized, var_map)
+            for vname in file_used:
+                if vname not in seen_used_vars:
+                    seen_used_vars.add(vname)
+                    used_variables.append(vname)
+            if file_missing:
+                missing_variables.append((file_path.name, file_missing))
+
+            if len(rendered) > MAX_MESSAGE_LENGTH:
+                chunks = split_markdown(rendered, MAX_MESSAGE_LENGTH)
+                oversized_markdown.append((file_path.name, len(rendered), len(chunks)))
             else:
-                chunks = [normalized]
+                chunks = [rendered]
 
             total = len(chunks)
             for idx, chunk in enumerate(chunks, start=1):
@@ -336,6 +385,8 @@ def scan_folder(
         oversized_markdown=oversized_markdown,
         oversized_images=oversized_images,
         empty_files=empty_files,
+        used_variables=used_variables,
+        missing_variables=missing_variables,
     )
 
 
@@ -419,6 +470,7 @@ class PostsAsCode(commands.Cog):
             token=None,
             last_commit=None,
             mappings={},
+            variables={},
         )
         self._guild_locks: dict[int, asyncio.Lock] = {}
 
@@ -967,6 +1019,61 @@ class PostsAsCode(commands.Cog):
             "Existing messages in Discord were not deleted."
         )
 
+    @postsascode.group(name="var", aliases=["vars"], invoke_without_command=True)
+    async def pac_var(self, ctx: commands.Context) -> None:
+        """Manage template variables (`{{VAR_NAME}}`) substituted into Markdown posts."""
+        await self.pac_var_list(ctx)
+
+    @pac_var.command(name="set")
+    async def pac_var_set(
+        self, ctx: commands.Context, name: str, *, value: str
+    ) -> None:
+        """Set a template variable value for `{{NAME}}` placeholders."""
+        cleaned_name = name.strip()
+        if not VAR_NAME_RE.match(cleaned_name):
+            await ctx.send(
+                "Invalid variable name. Use letters, digits, and underscores only "
+                "(starting with a letter or underscore, e.g. `MQTT_PASSWORD`)."
+            )
+            return
+
+        async with self._get_lock(ctx.guild.id):
+            async with self.config.guild(ctx.guild).variables() as variables:
+                variables[cleaned_name] = value
+
+        await ctx.send(
+            f"Set variable `{cleaned_name}` = `{value}`.\n"
+            f"Run `{ctx.clean_prefix}pac sync` to apply updated values to Discord."
+        )
+
+    @pac_var.command(name="unset", aliases=["delete", "rm", "remove"])
+    async def pac_var_unset(self, ctx: commands.Context, name: str) -> None:
+        """Remove a configured template variable."""
+        cleaned_name = name.strip()
+        async with self._get_lock(ctx.guild.id):
+            async with self.config.guild(ctx.guild).variables() as variables:
+                if cleaned_name not in variables:
+                    await ctx.send(f"Variable `{cleaned_name}` is not set.")
+                    return
+                variables.pop(cleaned_name)
+
+        await ctx.send(f"Removed variable `{cleaned_name}`.")
+
+    @pac_var.command(name="list")
+    async def pac_var_list(self, ctx: commands.Context) -> None:
+        """List all configured template variables and their current values."""
+        variables: dict[str, str] = await self.config.guild(ctx.guild).variables()
+        if not variables:
+            await ctx.send(
+                f"No template variables configured. Use `{ctx.clean_prefix}pac var set <NAME> <value>`."
+            )
+            return
+
+        lines = ["**Configured Variables:**"]
+        for name in sorted(variables):
+            lines.append(f"• `{name}` = `{variables[name]}`")
+        await self._send_chunked(ctx, "\n".join(lines))
+
     @postsascode.command(name="list")
     async def pac_list(self, ctx: commands.Context) -> None:
         """Show the configured repository and all channel/thread mappings."""
@@ -976,10 +1083,12 @@ class PostsAsCode(commands.Cog):
         has_token = "Yes" if cfg.get("token") else "No"
         last_commit = cfg.get("last_commit") or "*Never synced*"
         mappings: dict = cfg.get("mappings", {})
+        variables: dict = cfg.get("variables", {})
 
         lines = [
             f"**Repository:** {repo_url}",
-            f"**Branch:** `{branch}` | **Token set:** {has_token} | **Last commit:** `{last_commit}`",
+            f"**Branch:** `{branch}` | **Token set:** {has_token} | "
+            f"**Variables:** {len(variables)} | **Last commit:** `{last_commit}`",
             "",
         ]
 
@@ -1023,13 +1132,17 @@ class PostsAsCode(commands.Cog):
                     return
 
                 repo_dir = self._repo_dir(ctx.guild.id)
+                variables: dict[str, str] = await self.config.guild(ctx.guild).variables() or {}
                 report_lines = [f"**Diff preview @ `{commit_sha}`**"]
 
                 for tid, info in selected.items():
                     label = self._target_label(ctx.guild, tid)
                     try:
                         scan = scan_folder(
-                            repo_dir, info["path"], ctx.guild.filesize_limit
+                            repo_dir,
+                            info["path"],
+                            ctx.guild.filesize_limit,
+                            variables=variables,
                         )
                     except PostsAsCodeError as exc:
                         report_lines.append(f"• {label} (`{info['path']}`): ❌ {exc}")
@@ -1043,6 +1156,17 @@ class PostsAsCode(commands.Cog):
                         f"{unchanged} unchanged, {edited} edit(s), "
                         f"{created} new, {deleted} delete(s)"
                     )
+                    if scan.used_variables:
+                        var_details = ", ".join(
+                            f"`{name}`=`{variables[name]}`" for name in scan.used_variables
+                        )
+                        summary += f"\n  🔧 Variables: {var_details}"
+                    if scan.missing_variables:
+                        miss_details = ", ".join(
+                            f"`{fname}` ({', '.join(f'`{v}`' for v in vlist)})"
+                            for fname, vlist in scan.missing_variables
+                        )
+                        summary += f"\n  ⚠️ Unset variable(s): {miss_details}"
                     if scan.oversized_markdown:
                         details = ", ".join(
                             f"`{name}` ({chars} chars → {parts} posts)"
@@ -1139,21 +1263,34 @@ class PostsAsCode(commands.Cog):
                     return
 
                 repo_dir = self._repo_dir(ctx.guild.id)
+                variables: dict[str, str] = await self.config.guild(ctx.guild).variables() or {}
                 scans: dict[str, FolderScanResult] = {}
                 scan_errors: dict[str, str] = {}
                 all_oversized_md: list[tuple[str, str, int, int]] = []
                 all_oversized_img: list[tuple[str, str, int]] = []
+                all_used_vars: list[str] = []
+                seen_all_used: set[str] = set()
+                all_missing_vars: list[tuple[str, str, list[str]]] = []
 
                 for tid, info in selected.items():
                     try:
                         scan = scan_folder(
-                            repo_dir, info["path"], ctx.guild.filesize_limit
+                            repo_dir,
+                            info["path"],
+                            ctx.guild.filesize_limit,
+                            variables=variables,
                         )
                         scans[tid] = scan
                         for fname, chars, parts in scan.oversized_markdown:
                             all_oversized_md.append((info["path"], fname, chars, parts))
                         for fname, size in scan.oversized_images:
                             all_oversized_img.append((info["path"], fname, size))
+                        for vname in scan.used_variables:
+                            if vname not in seen_all_used:
+                                seen_all_used.add(vname)
+                                all_used_vars.append(vname)
+                        for fname, missing_list in scan.missing_variables:
+                            all_missing_vars.append((info["path"], fname, missing_list))
                     except PostsAsCodeError as exc:
                         scan_errors[tid] = str(exc)
 
@@ -1175,6 +1312,36 @@ class PostsAsCode(commands.Cog):
                 )
                 await ctx.send(f"❌ Nothing to sync:\n{err_lines}")
                 return
+
+            # Build variable summary and warn if any referenced variables are unset.
+            var_summary_lines: list[str] = []
+            for vname in all_used_vars:
+                var_summary_lines.append(f"• `{vname}` = `{variables[vname]}`")
+            if all_missing_vars:
+                seen_unset: set[str] = set()
+                for path, fname, mlist in all_missing_vars:
+                    for vname in mlist:
+                        if vname not in seen_unset:
+                            seen_unset.add(vname)
+                            var_summary_lines.append(f"• `{vname}` = ⚠️ **UNSET**")
+
+                missing_file_lines = "\n".join(
+                    f"• `{path}/{fname}`: {', '.join(f'`{{{{{v}}}}}`' for v in mlist)}"
+                    for path, fname, mlist in all_missing_vars
+                )
+                confirmed = await self._confirm_prompt(
+                    ctx,
+                    "⚠️ **Unset template variable(s) detected:**\n"
+                    f"{missing_file_lines}\n\n"
+                    "**Referenced variables:**\n"
+                    + "\n".join(var_summary_lines)
+                    + "\n\n"
+                    "Unset placeholders will be posted literally as `{{VAR_NAME}}`. "
+                    f"Reply `yes` to proceed anyway, or `no` to cancel and set them with `{ctx.clean_prefix}pac var set`.",
+                )
+                if not confirmed:
+                    await ctx.send("Sync cancelled. No Discord posts were modified.")
+                    return
 
             # Warn before modifying Discord if any .md file exceeds 2,000 characters.
             if all_oversized_md:
@@ -1256,6 +1423,11 @@ class PostsAsCode(commands.Cog):
                             f"• {label} (`{info['path']}`): {stats.unchanged} unchanged, "
                             f"{stats.edited} edited, {stats.created} created, {stats.deleted} deleted."
                         )
+
+            if var_summary_lines:
+                results.append("")
+                results.append("**Variables used:**")
+                results.extend(var_summary_lines)
 
             summary_msg = "\n".join(results)
             if mode == "reset" and target is not None and ctx.channel.id == target.id:

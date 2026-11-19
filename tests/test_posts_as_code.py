@@ -81,6 +81,12 @@ def _install_stubs():
 
                 return deco
 
+            def group(self, *args, **kwargs):
+                def deco(f):
+                    return _Group(f)
+
+                return deco
+
         class _Commands:
             Cog = _Cog
 
@@ -147,6 +153,7 @@ from posts_as_code.posts_as_code import (  # noqa: E402
     scan_folder,
     scrub_secrets,
     split_markdown,
+    substitute_variables,
     validate_repo_path,
 )
 
@@ -614,5 +621,81 @@ def test_partial_sync_saves_progress_on_http_error(tmp_path: Path):
         assert len(saved_slots) == 1
         assert saved_slots[0]["source"] == "01.md"
         assert "Partial sync error (progress saved)" in ctx.send.call_args[0][0]
+
+    asyncio.run(run())
+
+
+def test_substitute_variables_and_scan_folder(tmp_path: Path):
+    rendered, used, missing = substitute_variables(
+        "Host: {{MQTT_HOST}}, Pass: {{MQTT_PASS}}, JSON: {\"a\": 1}, Again: {{MQTT_HOST}}",
+        {"MQTT_HOST": "mqtt.example.org"},
+    )
+    assert rendered == "Host: mqtt.example.org, Pass: {{MQTT_PASS}}, JSON: {\"a\": 1}, Again: mqtt.example.org"
+    assert used == ["MQTT_HOST"]
+    assert missing == ["MQTT_PASS"]
+
+    folder = tmp_path / "docs"
+    folder.mkdir()
+    (folder / "01-mqtt.md").write_text(
+        "Server: {{MQTT_HOST}}\nPass: {{MQTT_PASS}}", encoding="utf-8"
+    )
+    scan = scan_folder(
+        tmp_path, "docs", filesize_limit=8 * 1024 * 1024, variables={"MQTT_HOST": "mqtt.azmsh.net"}
+    )
+    assert scan.used_variables == ["MQTT_HOST"]
+    assert scan.missing_variables == [("01-mqtt.md", ["MQTT_PASS"])]
+    assert "mqtt.azmsh.net" in scan.slots[0].content
+
+
+def test_sync_lists_variables_and_warns_on_unset(tmp_path: Path):
+    async def run():
+        guild = MagicMock()
+        guild.id = 42
+        guild.filesize_limit = 8 * 1024 * 1024
+        guild.me = MagicMock()
+
+        chan = FakeChannel(111, guild)
+        guild.get_channel_or_thread = lambda cid: chan if cid == 111 else None
+
+        repo_dir = tmp_path / "repos" / "42" / "docs"
+        repo_dir.mkdir(parents=True)
+        (repo_dir / "01-mqtt.md").write_text(
+            "Server: {{MQTT_HOST}}\nPass: {{MQTT_PASS}}", encoding="utf-8"
+        )
+
+        # 1) Unset variable triggers warning prompt; declining cancels with 0 posts
+        guild_data = {
+            "mappings": {"111": {"path": "docs", "slots": [], "last_synced": None}},
+            "variables": {"MQTT_HOST": "mqtt.azmsh.net"},
+        }
+        cog = _make_cog(tmp_path, guild_data)
+        cog._sync_git_repo = AsyncMock(return_value="abc1234")
+        cog._confirm_prompt = AsyncMock(return_value=False)
+
+        ctx = MagicMock()
+        ctx.guild = guild
+        ctx.channel = chan
+        ctx.clean_prefix = "!"
+        ctx.send = AsyncMock()
+        ctx.typing = MagicMock(return_value=AsyncMock(__aenter__=AsyncMock(), __aexit__=AsyncMock()))
+
+        await cog._execute_sync(ctx, target=chan, mode="edit")
+        assert len(chan.messages) == 0
+        prompt_text = cog._confirm_prompt.call_args[0][1]
+        assert "MQTT_HOST" in prompt_text and "mqtt.azmsh.net" in prompt_text
+        assert "MQTT_PASS" in prompt_text and "UNSET" in prompt_text
+
+        # 2) Once all variables are set, sync posts substituted values and lists them in summary
+        guild_data["variables"]["MQTT_PASS"] = "mesh123"
+        cog._confirm_prompt = AsyncMock(return_value=True)
+        await cog._execute_sync(ctx, target=chan, mode="edit")
+
+        assert len(chan.messages) == 1
+        assert chan.messages[0].content == "Server: mqtt.azmsh.net\nPass: mesh123"
+        assert not cog._confirm_prompt.called
+        summary = ctx.send.call_args[0][0]
+        assert "Variables used:" in summary
+        assert "`MQTT_HOST` = `mqtt.azmsh.net`" in summary
+        assert "`MQTT_PASS` = `mesh123`" in summary
 
     asyncio.run(run())
