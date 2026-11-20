@@ -36,6 +36,8 @@ SUPPORTED_EXTENSIONS = TEXT_EXTENSIONS | IMAGE_EXTENSIONS
 VALID_SYNC_MODES = ("edit", "repost", "reset")
 API_DELAY_SECONDS = 0.25
 CONFIRM_TIMEOUT_SECONDS = 60
+CONFIRM_EMOJI = "✅"
+CANCEL_EMOJI = "❌"
 VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 VAR_PLACEHOLDER_RE = re.compile(r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}")
 
@@ -683,10 +685,12 @@ class PostsAsCode(commands.Cog):
         ctx: commands.Context,
         text: str,
         delete_after: Optional[float] = None,
-    ) -> None:
+    ) -> Optional[discord.Message]:
         """Send potentially long status text split safely at <= 2,000 chars per message."""
+        last_msg: Optional[discord.Message] = None
         for page in pagify(text, delims=["\n"], page_length=1950):
-            await ctx.send(page, delete_after=delete_after)
+            last_msg = await ctx.send(page, delete_after=delete_after)
+        return last_msg
 
     @staticmethod
     def _target_label(guild: discord.Guild, target_id: Union[int, str]) -> str:
@@ -694,10 +698,46 @@ class PostsAsCode(commands.Cog):
         return chan.mention if chan else f"`{target_id}`"
 
     async def _confirm_prompt(self, ctx: commands.Context, prompt: str) -> bool:
-        """Ask ``ctx.author`` for yes/no confirmation in ``ctx.channel``."""
-        await self._send_chunked(ctx, prompt)
+        """Ask ``ctx.author`` to confirm via ✅ / ❌ emoji reactions on the prompt."""
+        prompt_msg = await self._send_chunked(ctx, prompt)
+        if prompt_msg is None:
+            return False
 
-        def check(msg: discord.Message) -> bool:
+        reactions_ok = True
+        try:
+            await prompt_msg.add_reaction(CONFIRM_EMOJI)
+            await prompt_msg.add_reaction(CANCEL_EMOJI)
+        except (discord.Forbidden, discord.HTTPException):
+            reactions_ok = False
+
+        if reactions_ok:
+            def reaction_check(
+                reaction: discord.Reaction, user: Union[discord.Member, discord.User]
+            ) -> bool:
+                return (
+                    user.id == ctx.author.id
+                    and reaction.message.id == prompt_msg.id
+                    and str(reaction.emoji) in (CONFIRM_EMOJI, CANCEL_EMOJI)
+                )
+
+            try:
+                reaction, _ = await self.bot.wait_for(
+                    "reaction_add",
+                    check=reaction_check,
+                    timeout=CONFIRM_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                await ctx.send("Confirmation timed out. Cancelled with no changes made.")
+                return False
+
+            return str(reaction.emoji) == CONFIRM_EMOJI
+
+        # Fallback if the bot lacks Add Reactions permission in ctx.channel.
+        await ctx.send(
+            "*(Could not add reactions here — reply `yes` to confirm or `no` to cancel.)*"
+        )
+
+        def msg_check(msg: discord.Message) -> bool:
             return (
                 msg.author.id == ctx.author.id
                 and msg.channel.id == ctx.channel.id
@@ -706,7 +746,7 @@ class PostsAsCode(commands.Cog):
 
         try:
             reply = await self.bot.wait_for(
-                "message", check=check, timeout=CONFIRM_TIMEOUT_SECONDS
+                "message", check=msg_check, timeout=CONFIRM_TIMEOUT_SECONDS
             )
         except asyncio.TimeoutError:
             await ctx.send("Confirmation timed out. Cancelled with no changes made.")
@@ -1490,8 +1530,9 @@ class PostsAsCode(commands.Cog):
                     "**Referenced variables:**\n"
                     + "\n".join(var_summary_lines)
                     + "\n\n"
-                    "Unset placeholders will be posted literally as `{{VAR_NAME}}`. "
-                    f"Reply `yes` to proceed anyway, or `no` to cancel and set them with `{ctx.clean_prefix}pac var set`.",
+                    "Unset placeholders will be posted literally as `{{VAR_NAME}}`.\n"
+                    f"React with {CONFIRM_EMOJI} to proceed anyway, or {CANCEL_EMOJI} to cancel "
+                    f"and set them with `{ctx.clean_prefix}pac var set`.",
                 )
                 if not confirmed:
                     await ctx.send("Sync cancelled. No Discord posts were modified.")
@@ -1507,8 +1548,8 @@ class PostsAsCode(commands.Cog):
                     ctx,
                     "⚠️ **Markdown character limit warning (> 2,000 chars):**\n"
                     f"{warn_lines}\n\n"
-                    "Reply `yes` to proceed with splitting these files into multiple posts, "
-                    "or `no` to cancel so you can edit the source files.",
+                    f"React with {CONFIRM_EMOJI} to proceed with splitting these files into multiple posts, "
+                    f"or {CANCEL_EMOJI} to cancel so you can edit the source files.",
                 )
                 if not confirmed:
                     await ctx.send("Sync cancelled. No Discord posts were modified.")
@@ -1523,7 +1564,7 @@ class PostsAsCode(commands.Cog):
                     f"⚠️ **Confirm full channel reset for {target.mention}:**\n"
                     f"This will permanently delete **ALL** messages in {target.mention} "
                     f"(including messages not sent by the bot) and re-post from `{repo_path}`.\n"
-                    "Reply `yes` to confirm or `no` to cancel.",
+                    f"React with {CONFIRM_EMOJI} to confirm or {CANCEL_EMOJI} to cancel.",
                 )
                 if not confirmed:
                     await ctx.send("Reset cancelled. No messages were deleted.")

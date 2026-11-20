@@ -48,6 +48,15 @@ def _install_stubs():
         class _Message:
             pass
 
+        class _Reaction:
+            pass
+
+        class _Member:
+            pass
+
+        class _User:
+            pass
+
         discord.MessageType = _MessageType
         discord.ChannelType = _ChannelType
         discord.HTTPException = _HTTPException
@@ -58,6 +67,9 @@ def _install_stubs():
         discord.Thread = _Thread
         discord.Guild = _Guild
         discord.Message = _Message
+        discord.Reaction = _Reaction
+        discord.Member = _Member
+        discord.User = _User
         sys.modules["discord"] = discord
 
     if "redbot" not in sys.modules:
@@ -753,5 +765,32 @@ def test_pac_test_reports_permissions_and_readiness(tmp_path: Path):
         # Read-only check must not post to either channel
         assert len(chan_ok.messages) == 0
         assert len(chan_no_send.messages) == 0
+
+    asyncio.run(run())
+
+
+def test_confirm_prompt_uses_emoji_reactions(tmp_path: Path):
+    async def run():
+        cog = _make_cog(tmp_path, {})
+        prompt_msg = MagicMock()
+        prompt_msg.id = 555
+        prompt_msg.add_reaction = AsyncMock()
+
+        ctx = MagicMock()
+        ctx.author = MagicMock(id=999)
+        ctx.channel = MagicMock(id=888)
+        ctx.send = AsyncMock(return_value=prompt_msg)
+
+        # Simulate ✅ reaction from invoking user
+        reaction_ok = MagicMock(emoji="✅", message=prompt_msg)
+        cog.bot.wait_for = AsyncMock(return_value=(reaction_ok, ctx.author))
+        assert await cog._confirm_prompt(ctx, "Proceed?") is True
+        prompt_msg.add_reaction.assert_any_call("✅")
+        prompt_msg.add_reaction.assert_any_call("❌")
+
+        # Simulate ❌ reaction from invoking user
+        reaction_cancel = MagicMock(emoji="❌", message=prompt_msg)
+        cog.bot.wait_for = AsyncMock(return_value=(reaction_cancel, ctx.author))
+        assert await cog._confirm_prompt(ctx, "Proceed?") is False
 
     asyncio.run(run())
